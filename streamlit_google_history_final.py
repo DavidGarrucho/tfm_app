@@ -17,6 +17,10 @@ from langchain_core.runnables.history import RunnableWithMessageHistory
 #from langchain_community.chat_message_histories import ChatMessageHistory
 from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_community.chat_message_histories import StreamlitChatMessageHistory
+from sklearn.metrics.pairwise import cosine_similarity
+import numpy as np
+import torch
+from transformers import AutoModelForSequenceClassification, AutoTokenizer
 
 
 
@@ -27,22 +31,69 @@ OUTPUT_PATH = "output"
 FAISS_GOOGLE_PATH = "output/faiss_index_ollama"
 NUMEXPR_MAX_THREADS = "16"
 
-CONTEXTUALIZE_Q_SYSTEM_PROMPT = """Given a chat history and the latest user question which might reference context in the chat history, formulate a standalone question which can be understood without the chat history. Do NOT answer the question, just reformulate it if needed and otherwise return it as is."""
+reranker_model = AutoModelForSequenceClassification.from_pretrained(
+    'jinaai/jina-reranker-v2-base-multilingual',
+    torch_dtype="float32",  # Cambiar a float32 para evitar BFloat16
+    trust_remote_code=True,
+)
 
-PROMPT_TEMPLATE_GOOGLE = """You are an intelligent assistant. Answer the question based solely on the information provided in the context, specific for Spain.
-Do not add any information beyond what is given. 
-If the context does not contain the answer, respond with: "The answer is not available in the provided context."
-Be concise and accurate. All the answers must be in Spanish language from Spain, in an informal manner.
-Answers must be clear, precise, and unambiguous, and a teenager should be able to understand the answer.
-Explicitly avoid phrases such as "según el documento", "según el capítulo", "en el texto", "como se menciona en el artículo", or any implication of external texts. Do not construct questions that require knowledge of the structure of the document or the location of information in it.
-Include the content-specific information that supports the answer to allow the answer to be independent of any external text.
-If the content lacks sufficient information to form a complete answer, do not force one.
-Create the answers in your own words; Direct copying of content is not permitted.
-NEVER mention the words "documento", "texto", "presentación", "archivo", "tabla", "artículo", "ley", "capítulo", "preámbulo", "título preliminar", "disposición" or "disposiciones generales" in your questions or answers.
-ALWAYS make sure that all answers are accurate, self-contained, and relevant, without relying on any original document or text or implying its existence, strictly avoiding any invention or speculation.
-IMPORTANT: if in the question there is no mention of a Comunidad Autonoma or the name of a city or province, try that the answer applies to Spain as a country.
+reranker_model.to('cuda') # or 'cpu' if no GPU is available
+reranker_model.eval()
 
-Context:
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+reranker_tokenizer = AutoTokenizer.from_pretrained('jinaai/jina-reranker-v2-base-multilingual')
+
+# CONTEXTUALIZE_Q_SYSTEM_PROMPT = """Given a chat history and the latest user question which might reference context in the chat history, formulate a standalone question which can be understood without the chat history. Do NOT answer the question, just reformulate it if needed and otherwise return it as is."""
+
+# PROMPT_TEMPLATE_GOOGLE = """You are an intelligent assistant. Answer the question based solely on the information provided in the context, specific for Spain.
+# Do not add any information beyond what is given. 
+# If the context does not contain the answer, respond with: "The answer is not available in the provided context."
+# Be concise and accurate. All the answers must be in Spanish language from Spain, in an informal manner.
+# Answers must be clear, precise, and unambiguous, and a teenager should be able to understand the answer.
+# Explicitly avoid phrases such as "según el documento", "según el capítulo", "en el texto", "como se menciona en el artículo", or any implication of external texts. Do not construct questions that require knowledge of the structure of the document or the location of information in it.
+# Include the content-specific information that supports the answer to allow the answer to be independent of any external text.
+# If the content lacks sufficient information to form a complete answer, do not force one.
+# Create the answers in your own words; Direct copying of content is not permitted.
+# NEVER mention the words "documento", "texto", "presentación", "archivo", "tabla", "artículo", "ley", "capítulo", "preámbulo", "título preliminar", "disposición" or "disposiciones generales" in your questions or answers.
+# ALWAYS make sure that all answers are accurate, self-contained, and relevant, without relying on any original document or text or implying its existence, strictly avoiding any invention or speculation.
+# IMPORTANT: if in the question there is no mention of a Comunidad Autonoma or the name of a city or province, try that the answer applies to Spain as a country.
+
+# Context:
+# {context}
+# """
+
+# CONTEXTUALIZE_Q_SYSTEM_PROMPT = """Dado un historial de chat y la última pregunta del usuario que podría referenciar contexto en dicho historial, reformula la pregunta para que sea independiente y comprensible sin necesidad de acceder al historial. No respondas la pregunta; solo reformúlala si es necesario, o devuélvela tal como está si ya es clara.
+# """
+
+# PROMPT_TEMPLATE_GOOGLE = """Eres un asistente inteligente. Responde a la pregunta basándote únicamente en la información proporcionada en el contexto, específico para España.
+
+# - No añadas ninguna información que no esté presente en el contexto.
+# - Si el contexto no contiene la respuesta, responde con: "La respuesta no está disponible en el contexto proporcionado."
+# - Sé conciso, preciso y exacto. Todas las respuestas deben ser en español de España y estar dirigidas a un público juvenil, con un tono cercano pero respetuoso.
+# - Las respuestas deben ser claras, fáciles de entender, y no deben depender de documentos externos o de la estructura de estos, **excepto si se solicita una referencia a un artículo o ley específica.**
+# - Evita frases como "según el documento", "como se menciona en el artículo", **a menos que el usuario pida explícitamente información sobre un artículo o ley**.
+# - La información específica que soporta la respuesta debe estar explícitamente mencionada, de modo que la respuesta sea autocontenida.
+# - Si el contexto no proporciona suficiente información, no inventes ni especules.
+# - Genera las respuestas con tus propias palabras, sin copiar directamente el contenido.
+# - **Puedes mencionar artículos, leyes u otros términos legales si el usuario lo solicita en su pregunta o si la información relevante proviene de un artículo legal.**
+# - Si no se menciona una Comunidad Autónoma o ciudad en la pregunta, genera una respuesta aplicable a toda España. Si hay una mención geográfica, adapta la respuesta a la región mencionada cuando corresponda.
+
+# Contexto:
+# {context}
+# """
+
+CONTEXTUALIZE_Q_SYSTEM_PROMPT = """Dado un historial de chat y la última pregunta del usuario que podría referenciar contexto en dicho historial, reformula la pregunta para que sea independiente y comprensible sin necesidad de acceder al historial. No respondas la pregunta; solo reformúlala si es necesario, o devuélvela tal como está si ya es clara.
+"""
+
+PROMPT_TEMPLATE_GOOGLE = """Eres un asistente inteligente. Responde a la pregunta basándote únicamente en la información proporcionada en el contexto, específico para España.
+
+- Siempre prioriza mencionar artículos o leyes que estén directamente relacionados con la pregunta del usuario.
+- Si el contexto no contiene la respuesta, responde con: "La respuesta no está disponible en el contexto proporcionado."
+- Si la pregunta se refiere a un tema legal, intenta identificar y citar el artículo de la ley que aplique.
+- Genera las respuestas con tus propias palabras, sin copiar directamente el contenido, y asegúrate de que sean claras, fáciles de entender y aplicables a un público juvenil.
+
+Contexto:
 {context}
 """
 
@@ -104,20 +155,68 @@ def get_conversational_chain(retriever, session_id):
     
     return conversational_rag_chain
 
+# Añadir función para calcular la similitud
+def calculate_similarity(embedding_1, embedding_2):
+    # Calcular similitud de coseno entre dos vectores
+    return cosine_similarity([embedding_1], [embedding_2])[0][0]
+
+def rerank_documents(query, documents):
+    # Cargar el modelo y tokenizer del reranker
+    # Crear los pares (query, document) para el reranker
+    sentence_pairs = [[query, doc] for doc in documents]
+    
+    # Tokenizar los pares
+    inputs = reranker_tokenizer(
+        [query] * len(documents),
+        documents,
+        return_tensors="pt",
+        padding=True,
+        truncation=True
+    ).to(device)
+
+    # Ejecutar el modelo para obtener los scores
+    with torch.no_grad():
+        outputs = reranker_model(**inputs)
+        scores = outputs.logits.squeeze().cpu().numpy()
+
+    # Ordenar los documentos según las puntuaciones
+    ranked_docs = sorted(zip(documents, scores), key=lambda x: x[1], reverse=True)
+    
+    return ranked_docs
 
 def user_input(user_question, k_value, session_id):
     #embeddings = GoogleGenerativeAIEmbeddings(model = MODEL_EMBEDDINGS_GOOGLE, task_type="retrieval_document")
     embeddings = HuggingFaceEmbeddings(model_name="paraphrase-xlm-r-multilingual-v1")
     new_db = FAISS.load_local(FAISS_GOOGLE_PATH, embeddings, allow_dangerous_deserialization=True)
     retriever = new_db.as_retriever(search_kwargs={"k": k_value})
+
+    # Obtener documentos relevantes
+    results = retriever.get_relevant_documents(user_question)
+    
+    # Extraer el contenido de los documentos para rerankear
+    docs_content = [doc.page_content for doc in results]
+
+    # Aplicar el reranker
+    ranked_documents = rerank_documents(user_question, docs_content)
+
+    # Seleccionar los mejores documentos rerankeados
+    top_documents = [doc for doc, score in ranked_documents[:3]]  # Puedes ajustar el número de documentos a usar
+
+    # Continuar con el proceso normal de generación de respuestas
     chain = get_conversational_chain(retriever, session_id)
+    
+    # Pasar los documentos relevantes (top_documents) al generador de respuestas
+    relevant_context = "\n".join(top_documents)
     response = chain.invoke(
-        {"input": user_question},
+        {"input": user_question, "context": relevant_context},
         config={
             "configurable": {"session_id": session_id}
         },
     )
+    
     return response
+
+
     
     
 def response_generator(prompt, k_value, session_id, logger):
